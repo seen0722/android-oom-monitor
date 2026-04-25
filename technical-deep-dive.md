@@ -368,7 +368,33 @@ Kill#  FreeMem   FilePages  ActiveAnon  SwapFree
 提早清除：  I/O 開始 → free 降到 625MB 就 kill cached apps → 保護 file cache
 ```
 
-### 4.4 預期效果
+### 4.4 方向 3：File Cache 最低保護（filecache_min_kb）
+
+lmkd 支援 `filecache_min_kb` — 當 file cache 低於此值時，lmkd 更積極 kill cached apps 來間接保護 file cache。
+
+| 參數 | 原始值 | 修改值 | 效果 |
+|------|--------|--------|------|
+| **filecache_min_kb** | 0（無保護） | **524288**（512 MB） | file cache < 512MB 時積極 kill cached apps |
+
+```
+設定方式（runtime 生效，重啟保留）：
+  persist.device_config.lmkd_native.filecache_min_kb=524288
+
+運作原理：
+  lmkd 收到 PSI event → 檢查 file_pages
+  → file_pages < 512 MB → 降低 min_score_adj（更積極 kill）
+  → kill cached apps → 釋放 anon pages → kswapd 壓力減輕
+  → file cache 不再被壓到 388 MB
+
+為什麼選 512 MB：
+  bugreport 顯示 FBG working set 約 388~618 MB
+  設 512 MB 確保 file cache 維持在 working set 附近
+  低於 512 MB 時 lmkd 會介入保護
+```
+
+注意：這不是 kernel 層級的保護。是 lmkd 的決策參考 — 透過更積極 kill cached apps 來間接保護 file cache 水位。
+
+### 4.5 預期效果
 
 ```
 修改前:
@@ -394,6 +420,7 @@ on property:sys.boot_completed=1
 # system.prop 或 vendor.prop
 sys.lmk.minfree_levels=18432:0,23040:100,27648:200,32256:250,110000:900,160000:950
 sys.sysctl.extra_free_kbytes=54674
+persist.device_config.lmkd_native.filecache_min_kb=524288
 ```
 
 ### 4.6 評估後排除的方案
@@ -411,6 +438,7 @@ sys.sysctl.extra_free_kbytes=54674
 | dirty_ratio 20→5 | 低 | 大量寫入 throughput 降低，一般使用無感 |
 | dirty_background_ratio 10→3 | 低 | writeback 更頻繁，輕微增加 I/O |
 | minfree adj=950 提高 | 低 | 背景 app cold start 機率增加 |
+| filecache_min_kb=512MB | 低 | file cache 低於 512MB 時更積極 kill cached apps |
 | vfs_cache_pressure 100→150 | 低 | 輕微 cache miss |
 
 ---
