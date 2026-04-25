@@ -221,24 +221,77 @@ File pages 被回收 → 變成 FreeMem
 → 循環！FreeMem 在快速波動。
 ```
 
-### 3.3 Dirty Pages 是真正的元兇
+### 3.3 Kill #99 — Files by Google 被 Kill 時的完整快照
 
 ```
-之前的假設（部分錯誤）：
-  Files by Google Java heap 膨脹 2.5GB → 擠掉 file cache → thrashing
+Kill #99 — pid=4796 (.apps.nbu.files)
+Time: 02-09 15:44:47.847
 
-bugreport 實際數據：
-  Anonymous memory 沒有膨脹（反而下降 279 MB）
-  File cache 消失的 3603 MB 主要變成了 FreeMem
+  oom_score_adj   = 0         ← Foreground app（正在使用中）
+  min_oom_score   = 0         ← CRITICAL 層級（連前台都可 kill）
+  tasksize (RSS)  = 681 MB    ← FBG 實際佔用（不是之前推測的 2.5GB）
+  total_vm        = 1668 MB
+  free_mem        = 1037 MB
+  file_pages      = 618 MB
+  inactive_file   = 128 MB    ← 可回收的 file cache 幾乎沒了
+  active_anon     = 201 MB
+  swap_free       = 4185 MB   ← Swap 幾乎沒用
+  PSI full_avg10  = 16.49     ← 嚴重 full stall
+  thrashing%      = 1463%     ← 遠超 300% 門檻
+```
 
-正確的因果鏈：
-  大量 I/O → dirty pages 堆積到 1.2GB（dirty_ratio=20 的上限）
-  → 1.2GB RAM 被 dirty pages 鎖住（不可回收，必須等 writeback）
-  → kswapd 被迫回收 clean file cache 來騰出空間
+### 3.4 假設修正：Dirty Pages 堆積 vs 實際數據
+
+**重要發現**：killinfo 中所有 121 筆的 dirty pages 估算值都接近 0。
+
+```
+之前的假設：
+  dirty pages 堆積到 1.2GB（dirty_ratio=20 的上限）→ 擠掉 file cache
+
+killinfo 實際數據：
+  Kill #1:  file_pages=388MB, active_file=1241MB, inactive_file=256MB
+  → dirty ≈ file_pages - active - inactive ≈ 0
+
+  Kill #99: file_pages=618MB, active_file=1009MB, inactive_file=128MB
+  → dirty ≈ 0
+```
+
+這有兩種解釋：
+
+```
+解釋 A：killinfo 記錄的是 kill 瞬間的快照
+  複製過程中 dirty pages 可能確實很高
+  → 但 writeback 在 kill 前已完成
+  → killinfo 拍到的是 dirty=0 的瞬間
+  → dirty_ratio mitigation 仍然有效
+
+解釋 B：USB 讀取速度太慢，dirty pages 從未堆積
+  USB → read() 速度有限
+  → writeback 總是跟得上
+  → dirty pages 從未堆積到 1.2GB
+  → dirty_ratio mitigation 效果有限
+```
+
+**需要用 monitor.sh 在複製過程中持續監控 dirty pages 峰值來驗證。**
+
+### 3.5 修正後的因果鏈
+
+```
+確認的事實（從 killinfo 證實）：
+  - File pages 從 3991 MB 降到 388 MB（消失 3603 MB）
+  - Anonymous 沒有膨脹（反而減少 279 MB）
+  - FBG RSS = 681 MB（不是 2.5GB）
+  - thrashing% 從頭到尾 > 1200%
+  - SwapFree 始終 > 3.3 GB
+
+因果鏈：
+  大量 I/O（USB → Internal Storage）
+  → kswapd 大量回收 file cache（原因待驗證：dirty pages 或其他壓力源）
   → file cache 從 3991 MB 被回收到 388 MB
   → 剩餘的 388 MB 是 FBG 的 working set
   → kswapd 回收它們 → 立刻 refault → thrashing
-  → PSI stall → lmkd kill → Files by Google 被 kill
+  → thrashing% > 300% → PSI CRITICAL → min_oom_score=0
+  → lmkd kill Files by Google（tasksize 681 MB，前台最大的 process）
 ```
 
 ### 3.4 kswapd 回收活動證據
@@ -279,29 +332,26 @@ Kill#  FreeMem   FilePages  ActiveAnon  SwapFree
 ### 4.1 核心策略
 
 ```
-方向 1: 減少 dirty pages 佔用 → 保護 file cache 不被擠壓
-方向 2: 提早清除 cached apps → 減少對 file cache 的回收壓力
+方向 1: 減少 dirty pages 佔用 → 保護 file cache 不被擠壓（待驗證效果）
+方向 2: 提早清除 cached apps → 減少 kswapd 對 file cache 的回收壓力
 ```
 
-### 4.2 方向 1：限制 Dirty Page Cache（核心措施）
+### 4.2 方向 1：限制 Dirty Page Cache
 
 | 參數 | 原始值 | 修改值 | 效果 |
 |------|--------|--------|------|
-| **dirty_ratio** | 20 | **5** | dirty 上限 1.2GB → 300MB，省出 900MB |
+| **dirty_ratio** | 20 | **5** | dirty 上限 1.2GB → 300MB |
 | **dirty_background_ratio** | 10 | **3** | writeback 在 180MB 啟動（原 600MB） |
 | vfs_cache_pressure | 100 | **150** | 更積極回收 dentry/inode cache |
 
-運作原理：
+**效果待驗證**：killinfo 中 dirty pages 接近 0（kill 瞬間快照），無法確認複製過程中的 dirty pages 峰值。需要用 monitor.sh 在 USB → Internal 複製過程中持續監控 dirty pages 來判斷此措施是否有效。
 
 ```
-修改前 (dirty_ratio=20):
-  write() → dirty 堆到 1.2GB → kswapd 回收 file cache → 388MB → thrashing → crash
-
-修改後 (dirty_ratio=5):
-  write() → dirty 到 300MB 就阻塞 → file cache 維持 ~1288MB → 不 thrashing
+如果複製中 dirty peaks > 300 MB → dirty_ratio=5 有效（限制堆積）
+如果複製中 dirty peaks < 300 MB → dirty_ratio=5 效果有限（USB 太慢，dirty 來不及堆積）
 ```
 
-驗證結果：✓ 已在 T70 (DBB260100011) 上 runtime 測試成功。
+驗證狀態：⚠ 參數已在 T70 上 runtime 測試可套用，但實際效果待 monitor.sh 數據驗證。
 
 ### 4.3 方向 2：提早清除 Cached Apps（輔助措施）
 
